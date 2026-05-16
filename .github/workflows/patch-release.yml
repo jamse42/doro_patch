@@ -284,5 +284,5 @@ jobs:
 
           files: assets/*.zip
           draft: false
-          prerelease: true
+          prerelease: false
           overwrite_files: true
