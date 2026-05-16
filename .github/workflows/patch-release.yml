@@ -1,0 +1,288 @@
+name: Patch Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "MDA tag to build. Leave empty to use latest release."
+        required: false
+        default: ""
+      publish_release:
+        description: "Publish a GitHub release after build"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+  schedule:
+    - cron: "0 6 * * *"
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPOSITORY: 1204244136/MDA
+  # Keep these empty to match upstream behavior: download latest MaaFramework/MXU.
+  MAAFW_VERSION: ""
+  MXU_VERSION: ""
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      upstream_tag: ${{ steps.meta.outputs.upstream_tag }}
+      custom_tag: ${{ steps.meta.outputs.custom_tag }}
+      release_exists: ${{ steps.release_exists.outputs.result }}
+    steps:
+      - name: Checkout patch repository
+        uses: actions/checkout@v5
+
+      - name: Resolve upstream release
+        id: meta
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+
+          upstream_tag="$INPUT_TAG"
+          if [ -z "$upstream_tag" ]; then
+            upstream_tag="$(gh release view --repo "$UPSTREAM_REPOSITORY" --json tagName --jq .tagName)"
+          fi
+
+          custom_tag="${upstream_tag}-patched"
+
+          echo "upstream_tag=$upstream_tag" | tee -a "$GITHUB_OUTPUT"
+          echo "custom_tag=$custom_tag" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Check existing patched release
+        id: release_exists
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CUSTOM_TAG: ${{ steps.meta.outputs.custom_tag }}
+        run: |
+          if gh release view "$CUSTOM_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "result=true" | tee -a "$GITHUB_OUTPUT"
+          else
+            echo "result=false" | tee -a "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download upstream source archive
+        if: ${{ steps.release_exists.outputs.result != 'true' || github.event_name == 'workflow_dispatch' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ steps.meta.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          gh release download "$UPSTREAM_TAG" \
+            --repo "$UPSTREAM_REPOSITORY" \
+            --archive zip \
+            --output upstream-source.zip
+
+          unzip -q upstream-source.zip -d upstream-src
+          shopt -s dotglob nullglob
+          mkdir source
+          mv upstream-src/*/* source/
+
+      - name: Restore MaaCommonAssets submodule
+        if: ${{ steps.release_exists.outputs.result != 'true' || github.event_name == 'workflow_dispatch' }}
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ steps.meta.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+
+          git init upstream-git
+          git -C upstream-git remote add origin "https://github.com/$UPSTREAM_REPOSITORY.git"
+          git -C upstream-git fetch --depth 1 origin "refs/tags/$UPSTREAM_TAG:refs/tags/$UPSTREAM_TAG"
+
+          submodule_sha="$(git -C upstream-git ls-tree --format='%(objectname)' "$UPSTREAM_TAG" assets/MaaCommonAssets)"
+          if [ -z "$submodule_sha" ]; then
+            echo "::error::assets/MaaCommonAssets submodule not found in $UPSTREAM_TAG"
+            exit 1
+          fi
+
+          rm -rf source/assets/MaaCommonAssets
+          mkdir -p source/assets/MaaCommonAssets
+          git init source/assets/MaaCommonAssets
+          git -C source/assets/MaaCommonAssets remote add origin "https://github.com/MaaXYZ/MaaCommonAssets.git"
+          git -C source/assets/MaaCommonAssets fetch --depth 1 origin "$submodule_sha"
+          git -C source/assets/MaaCommonAssets checkout --detach FETCH_HEAD
+          rm -rf source/assets/MaaCommonAssets/.git upstream-git
+
+      - name: Apply patch script
+        if: ${{ steps.release_exists.outputs.result != 'true' || github.event_name == 'workflow_dispatch' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp patch_script.sh source/patch_script.sh
+          cd source
+          sh ./patch_script.sh
+          rm patch_script.sh
+
+      - name: Upload patched source
+        if: ${{ steps.release_exists.outputs.result != 'true' || github.event_name == 'workflow_dispatch' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: patched-source-${{ steps.meta.outputs.upstream_tag }}
+          path: source
+          retention-days: 1
+
+  build:
+    needs: prepare
+    if: ${{ needs.prepare.outputs.release_exists != 'true' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ${{ matrix.os == 'win' && 'windows-latest' || (matrix.os == 'macos' && 'macos-latest' || 'ubuntu-latest') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [win]
+        arch: [x86_64]
+    steps:
+      - name: Download patched source
+        uses: actions/download-artifact@v7
+        with:
+          name: patched-source-${{ needs.prepare.outputs.upstream_tag }}
+          path: .
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: agent/go-service/go.mod
+          cache-dependency-path: |
+            agent/go-service/go.mod
+            agent/go-service/go.sum
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+
+      - name: Download MaaFramework
+        uses: robinraju/release-downloader@v1
+        with:
+          repository: MaaXYZ/MaaFramework
+          fileName: MAA-${{ matrix.os }}-${{ matrix.arch }}*
+          latest: ${{ env.MAAFW_VERSION == '' }}
+          tag: ${{ env.MAAFW_VERSION }}
+          out-file-path: deps
+          extract: true
+
+      - name: Download MXU
+        if: ${{ !(matrix.os == 'linux' && matrix.arch == 'aarch64') }}
+        id: download_mxu
+        uses: robinraju/release-downloader@v1
+        with:
+          repository: MistEO/MXU
+          fileName: "*${{ matrix.os }}-${{ matrix.arch }}*"
+          latest: ${{ env.MXU_VERSION == '' }}
+          tag: ${{ env.MXU_VERSION }}
+          out-file-path: MXU
+          extract: true
+
+      - name: Clean up MXU archive
+        if: ${{ !(matrix.os == 'linux' && matrix.arch == 'aarch64') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive_file_path='${{ fromJson(steps.download_mxu.outputs.downloaded_files)[0] }}'
+          rm -f "$archive_file_path"
+
+      - name: Install Python requirements
+        shell: bash
+        run: python -m pip install -r tools/requirements.txt
+
+      - name: Build Go Agent
+        shell: bash
+        run: python tools/install.py --build-go-only ${{ needs.prepare.outputs.custom_tag }} ${{ matrix.os }} ${{ matrix.arch }}
+
+      - name: Install
+        shell: bash
+        run: python tools/install.py ${{ needs.prepare.outputs.custom_tag }} ${{ matrix.os }} ${{ matrix.arch }}
+
+      - name: Integrate MXU into install directory
+        if: ${{ !(matrix.os == 'linux' && matrix.arch == 'aarch64') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d "MXU" ]; then
+            if [[ "${{ matrix.os }}" == "win" ]]; then
+              if [ -f "MXU/mxu.exe" ]; then
+                cp "MXU/mxu.exe" "install/MDA.exe"
+              fi
+            else
+              if [ -f "MXU/mxu" ]; then
+                cp "MXU/mxu" "install/MDA"
+              fi
+            fi
+
+            while IFS= read -r -d '' dir; do
+              cp -r "$dir" install/
+            done < <(find MXU -maxdepth 1 -mindepth 1 -type d -print0)
+          fi
+
+      - name: Convert PNG to ICO
+        if: matrix.os == 'win' && matrix.arch == 'x86_64'
+        shell: bash
+        run: |
+          choco install imagemagick -y
+          magick convert assets/logo.png -define icon:auto-resize=256,128,64,48,32,24,16 MDA.ico
+          cp MDA.ico install/logo.ico
+
+      - name: Modify MXU exe icon
+        if: matrix.os == 'win' && matrix.arch == 'x86_64'
+        shell: bash
+        run: |
+          curl -L https://github.com/electron/rcedit/releases/download/v2.0.0/rcedit-x64.exe -o rcedit.exe
+          if [ -f "install/MDA.exe" ]; then
+            ./rcedit.exe "install/MDA.exe" --set-icon "MDA.ico"
+          elif [ -f "install/mxu.exe" ]; then
+            ./rcedit.exe "install/mxu.exe" --set-icon "MDA.ico"
+          fi
+
+      - name: Verify install contents
+        shell: bash
+        run: |
+          test -f install/interface.json
+          ls -la install | head -20
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.os }}-${{ matrix.arch }}-${{ needs.prepare.outputs.custom_tag }}
+          path: install
+          retention-days: 7
+
+  release:
+    needs: [prepare, build]
+    if: ${{ (needs.prepare.outputs.release_exists != 'true' || github.event_name == 'workflow_dispatch') && inputs.publish_release != 'false' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: win-x86_64-${{ needs.prepare.outputs.custom_tag }}
+          path: artifact
+
+      - name: Zip artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p assets
+          (cd artifact && zip -r "../assets/win-x86_64-${{ needs.prepare.outputs.custom_tag }}.zip" .)
+
+      - name: Publish patched release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.custom_tag }}
+          name: ${{ needs.prepare.outputs.custom_tag }}
+          body: |
+            Patched build from upstream release `${{ needs.prepare.outputs.upstream_tag }}`.
+
+          files: assets/*.zip
+          draft: false
+          prerelease: true
+          overwrite_files: true
