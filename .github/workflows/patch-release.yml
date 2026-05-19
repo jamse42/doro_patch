@@ -16,7 +16,7 @@ on:
           - "true"
           - "false"
   schedule:
-    - cron: "0 6 */3 * *"
+    - cron: "2 * * * *"
 
 permissions:
   contents: write
