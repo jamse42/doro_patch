@@ -1,0 +1,13 @@
+name: Schedule Probe
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "37 * * * *"
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - run: date -u
+      - run: echo "schedule probe"
