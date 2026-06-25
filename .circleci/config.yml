@@ -1,31 +1,236 @@
-# Use the latest 2.1 version of CircleCI pipeline process engine.
-# See: https://circleci.com/docs/reference/configuration-reference
 version: 2.1
 
-# Define a job to be invoked later in a workflow.
-# See: https://circleci.com/docs/guides/orchestrate/jobs-steps/#jobs-overview & https://circleci.com/docs/reference/configuration-reference/#jobs
+parameters:
+  upstream_tag:
+    type: string
+    default: ""
+  force_rebuild:
+    type: boolean
+    default: false
+  publish_release:
+    type: boolean
+    default: true
+
 jobs:
-  say-hello:
-    # Specify the execution environment. You can specify an image from Docker Hub or use one of our convenience images from CircleCI's Developer Hub.
-    # See: https://circleci.com/docs/guides/execution-managed/executor-intro/ & https://circleci.com/docs/reference/configuration-reference/#executor-job
-    docker:
-      # Specify the version you desire here
-      # See: https://circleci.com/developer/images/image/cimg/base
-      - image: cimg/base:current
-
-    # Add steps to the job
-    # See: https://circleci.com/docs/guides/orchestrate/jobs-steps/#steps-overview & https://circleci.com/docs/reference/configuration-reference/#steps
+  build-and-release:
+    machine:
+      image: windows-server-2022-gui:current
+    resource_class: windows.medium
+    shell: powershell.exe -ExecutionPolicy Bypass
+    environment:
+      UPSTREAM_REPOSITORY: "1204244136/MDA"
+      MAAFW_VERSION: ""
+      MXU_VERSION: ""
+      INPUT_UPSTREAM_TAG: "<< pipeline.parameters.upstream_tag >>"
+      FORCE_REBUILD: "<< pipeline.parameters.force_rebuild >>"
+      PUBLISH_RELEASE: "<< pipeline.parameters.publish_release >>"
     steps:
-      # Checkout the code as the first step.
       - checkout
-      - run:
-          name: "Say hello"
-          command: "echo Hello, World!"
 
-# Orchestrate jobs using workflows
-# See: https://circleci.com/docs/guides/orchestrate/workflows/ & https://circleci.com/docs/reference/configuration-reference/#workflows
+      - run:
+          name: Install build tools
+          no_output_timeout: 30m
+          command: |
+            $ErrorActionPreference = "Stop"
+
+            choco install gh golang python imagemagick 7zip -y --no-progress
+
+            $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+            $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+            $env:Path = "$machinePath;$userPath;$env:ProgramFiles\7-Zip"
+
+            gh --version
+            git --version
+            go version
+            python --version
+            magick -version
+
+      - run:
+          name: Build and publish patched release
+          no_output_timeout: 60m
+          command: |
+            $ErrorActionPreference = "Stop"
+
+            $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+            $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+            $env:Path = "$machinePath;$userPath;$env:ProgramFiles\7-Zip"
+
+            function Exec {
+              param(
+                [Parameter(Mandatory = $true)][string]$FilePath,
+                [Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments
+              )
+
+              & $FilePath @Arguments
+
+              if ($LASTEXITCODE -ne 0) {
+                throw "Command failed ($LASTEXITCODE): $FilePath $($Arguments -join ' ')"
+              }
+            }
+
+            function Extract-DownloadedArchives {
+              param([string]$Directory)
+
+              $sevenZip = Join-Path $env:ProgramFiles "7-Zip\7z.exe"
+              if (-not (Test-Path $sevenZip)) {
+                $sevenZip = "7z.exe"
+              }
+
+              Get-ChildItem $Directory -File | ForEach-Object {
+                Exec $sevenZip x $_.FullName "-o$Directory" -y
+                Remove-Item $_.FullName -Force
+              }
+            }
+
+            if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
+              throw "GH_TOKEN is missing. Set it in CircleCI Project Settings -> Environment Variables."
+            }
+
+            $targetRepo = $env:TARGET_REPOSITORY
+            if ([string]::IsNullOrWhiteSpace($targetRepo)) {
+              $targetRepo = "$env:CIRCLE_PROJECT_USERNAME/$env:CIRCLE_PROJECT_REPONAME"
+            }
+
+            $upstreamTag = $env:INPUT_UPSTREAM_TAG
+            if ([string]::IsNullOrWhiteSpace($upstreamTag)) {
+              $upstreamTag = (& gh release view --repo $env:UPSTREAM_REPOSITORY --json tagName --jq .tagName).Trim()
+              if ($LASTEXITCODE -ne 0) {
+                throw "Failed to resolve latest upstream release."
+              }
+            }
+
+            $customTag = "$upstreamTag-patched"
+
+            Write-Host "Upstream tag: $upstreamTag"
+            Write-Host "Custom tag: $customTag"
+            Write-Host "Target repo: $targetRepo"
+
+            $releaseExists = $false
+            & gh release view $customTag --repo $targetRepo *> $null
+            if ($LASTEXITCODE -eq 0) {
+              $releaseExists = $true
+            }
+
+            if ($releaseExists -and $env:FORCE_REBUILD -ne "true") {
+              Write-Host "Release $customTag already exists. Skipping scheduled build."
+              circleci-agent step halt
+            }
+
+            Remove-Item upstream-source.zip, upstream-src, source, upstream-git -Recurse -Force -ErrorAction SilentlyContinue
+
+            Exec gh release download $upstreamTag --repo $env:UPSTREAM_REPOSITORY --archive zip --output upstream-source.zip
+
+            Expand-Archive upstream-source.zip upstream-src -Force
+
+            $sourceRoot = Get-ChildItem upstream-src -Directory | Select-Object -First 1
+            if (-not $sourceRoot) {
+              throw "Upstream source archive did not contain a top-level directory."
+            }
+
+            New-Item source -ItemType Directory -Force | Out-Null
+            Copy-Item -Path (Join-Path $sourceRoot.FullName "*") -Destination source -Recurse -Force
+
+            Exec git init upstream-git
+            Exec git -C upstream-git remote add origin "https://github.com/$env:UPSTREAM_REPOSITORY.git"
+            Exec git -C upstream-git fetch --depth 1 origin "refs/tags/${upstreamTag}:refs/tags/${upstreamTag}"
+
+            $submoduleSha = (& git -C upstream-git ls-tree "--format=%(objectname)" $upstreamTag assets/MaaCommonAssets).Trim()
+            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($submoduleSha)) {
+              throw "assets/MaaCommonAssets submodule not found in $upstreamTag."
+            }
+
+            Remove-Item source/assets/MaaCommonAssets -Recurse -Force -ErrorAction SilentlyContinue
+            New-Item source/assets/MaaCommonAssets -ItemType Directory -Force | Out-Null
+
+            Exec git init source/assets/MaaCommonAssets
+            Exec git -C source/assets/MaaCommonAssets remote add origin "https://github.com/MaaXYZ/MaaCommonAssets.git"
+            Exec git -C source/assets/MaaCommonAssets fetch --depth 1 origin $submoduleSha
+            Exec git -C source/assets/MaaCommonAssets checkout --detach FETCH_HEAD
+
+            Remove-Item source/assets/MaaCommonAssets/.git -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item upstream-git -Recurse -Force -ErrorAction SilentlyContinue
+
+            Copy-Item patch_script.sh source/patch_script.sh -Force
+
+            $bash = "C:\Program Files\Git\bin\bash.exe"
+            if (-not (Test-Path $bash)) {
+              $bash = "bash.exe"
+            }
+
+            Exec $bash -lc "cd source && sh ./patch_script.sh && rm patch_script.sh"
+
+            Push-Location source
+
+            New-Item deps -ItemType Directory -Force | Out-Null
+            if ([string]::IsNullOrWhiteSpace($env:MAAFW_VERSION)) {
+              Exec gh release download --repo MaaXYZ/MaaFramework --pattern "MAA-win-x86_64*" --dir deps --clobber
+            } else {
+              Exec gh release download $env:MAAFW_VERSION --repo MaaXYZ/MaaFramework --pattern "MAA-win-x86_64*" --dir deps --clobber
+            }
+            Extract-DownloadedArchives "deps"
+
+            New-Item MXU -ItemType Directory -Force | Out-Null
+            if ([string]::IsNullOrWhiteSpace($env:MXU_VERSION)) {
+              Exec gh release download --repo MistEO/MXU --pattern "*win-x86_64*" --dir MXU --clobber
+            } else {
+              Exec gh release download $env:MXU_VERSION --repo MistEO/MXU --pattern "*win-x86_64*" --dir MXU --clobber
+            }
+            Extract-DownloadedArchives "MXU"
+
+            Exec python -m pip install -r tools/requirements.txt
+
+            Exec python tools/install.py --build-go-only $customTag win x86_64
+            Exec python tools/install.py $customTag win x86_64
+
+            if (Test-Path "MXU/mxu.exe") {
+              Copy-Item "MXU/mxu.exe" "install/MDA.exe" -Force
+            }
+
+            Get-ChildItem MXU -Directory | ForEach-Object {
+              Copy-Item $_.FullName install -Recurse -Force
+            }
+
+            Exec magick assets/logo.png -define icon:auto-resize=256,128,64,48,32,24,16 MDA.ico
+            Copy-Item MDA.ico install/logo.ico -Force
+
+            Invoke-WebRequest -Uri "https://github.com/electron/rcedit/releases/download/v2.0.0/rcedit-x64.exe" -OutFile rcedit.exe
+
+            if (Test-Path "install/MDA.exe") {
+              Exec .\rcedit.exe "install/MDA.exe" --set-icon "MDA.ico"
+            } elseif (Test-Path "install/mxu.exe") {
+              Exec .\rcedit.exe "install/mxu.exe" --set-icon "MDA.ico"
+            }
+
+            if (-not (Test-Path "install/interface.json")) {
+              throw "install/interface.json not found."
+            }
+
+            Get-ChildItem install | Select-Object -First 20
+
+            New-Item assets -ItemType Directory -Force | Out-Null
+            $assetPath = "assets/win-x86_64-$customTag.zip"
+            Compress-Archive -Path install/* -DestinationPath $assetPath -Force
+
+            if ($env:PUBLISH_RELEASE -eq "true") {
+              $notes = "Patched build from upstream release $upstreamTag."
+
+              if ($releaseExists) {
+                Exec gh release upload $customTag $assetPath --repo $targetRepo --clobber
+                Exec gh release edit $customTag --repo $targetRepo --title $customTag --notes $notes --prerelease
+              } else {
+                Exec gh release create $customTag $assetPath --repo $targetRepo --title $customTag --notes $notes --prerelease
+              }
+            } else {
+              Write-Host "publish_release=false, skipping GitHub Release publish."
+            }
+
+            Pop-Location
+
+      - store_artifacts:
+          path: source/assets
+          destination: release-assets
+
 workflows:
-  say-hello-workflow: # This is the name of the workflow, feel free to change it to better match your workflow.
-    # Inside the workflow, you define the jobs you want to run.
+  build:
     jobs:
-      - say-hello
+      - build-and-release
