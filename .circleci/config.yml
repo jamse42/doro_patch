@@ -106,9 +106,11 @@ jobs:
             Write-Host "Target repo: $targetRepo"
 
             $releaseExists = $false
-            & gh release view $customTag --repo $targetRepo *> $null
-            if ($LASTEXITCODE -eq 0) {
-              $releaseExists = $true
+            try {
+              & gh release view $customTag --repo $targetRepo 2>&1 | Out-Null
+              $releaseExists = ($LASTEXITCODE -eq 0)
+            } catch {
+              $releaseExists = $false
             }
 
             if ($releaseExists -and $env:FORCE_REBUILD -ne "true") {
