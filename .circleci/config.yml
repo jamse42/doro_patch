@@ -106,9 +106,21 @@ jobs:
             Write-Host "Target repo: $targetRepo"
 
             $releaseExists = $false
-            & gh release view $customTag --repo $targetRepo *> $null
-            if ($LASTEXITCODE -eq 0) {
+            $oldErrorActionPreference = $ErrorActionPreference
+            $ErrorActionPreference = "Continue"
+            try {
+              $releaseViewOutput = (& gh release view $customTag --repo $targetRepo 2>&1 | Out-String).Trim()
+              $releaseViewExitCode = $LASTEXITCODE
+            } finally {
+              $ErrorActionPreference = $oldErrorActionPreference
+            }
+
+            if ($releaseViewExitCode -eq 0) {
               $releaseExists = $true
+            } elseif ($releaseViewOutput -match "release not found") {
+              Write-Host "Release $customTag does not exist yet. Continuing with build."
+            } else {
+              throw "Failed to check existing release $customTag in ${targetRepo}: $releaseViewOutput"
             }
 
             if ($releaseExists -and $env:FORCE_REBUILD -ne "true") {
