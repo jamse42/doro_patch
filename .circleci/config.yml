@@ -228,9 +228,9 @@ jobs:
 
               if ($releaseExists) {
                 Exec gh release upload $customTag $assetPath --repo $targetRepo --clobber
-                Exec gh release edit $customTag --repo $targetRepo --title $customTag --notes $notes --prerelease
+                Exec gh release edit $customTag --repo $targetRepo --title $customTag --notes $notes --prerelease=false
               } else {
-                Exec gh release create $customTag $assetPath --repo $targetRepo --title $customTag --notes $notes --prerelease
+                Exec gh release create $customTag $assetPath --repo $targetRepo --title $customTag --notes $notes
               }
             } else {
               Write-Host "publish_release=false, skipping GitHub Release publish."
