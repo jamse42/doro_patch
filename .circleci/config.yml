@@ -39,10 +39,15 @@ jobs:
             $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
             $env:Path = "$machinePath;$userPath;$env:ProgramFiles\7-Zip"
 
+            # Install uv (Python dependency manager, align with upstream MDA workflow)
+            powershell -NoProfile -ExecutionPolicy Bypass -c "irm https://astral.sh/uv/install.ps1 | iex"
+            $env:Path = "$env:USERPROFILE\.local\bin;$machinePath;$userPath;$env:ProgramFiles\7-Zip"
+
             gh --version
             git --version
             go version
             python --version
+            uv --version
             magick -version
 
       - run:
@@ -53,7 +58,8 @@ jobs:
 
             $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
             $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-            $env:Path = "$machinePath;$userPath;$env:ProgramFiles\7-Zip"
+            # Prepend uv install dir explicitly in case the User PATH refresh lags behind
+            $env:Path = "$env:USERPROFILE\.local\bin;$machinePath;$userPath;$env:ProgramFiles\7-Zip"
 
             function Exec {
               param(
@@ -189,10 +195,10 @@ jobs:
             }
             Extract-DownloadedArchives "MXU"
 
-            Exec python -m pip install -r tools/requirements.txt
+            Remove-Item install -Recurse -Force -ErrorAction SilentlyContinue
 
-            Exec python tools/install.py --build-go-only $customTag win x86_64
-            Exec python tools/install.py $customTag win x86_64
+            Exec uv run --frozen --only-group install python tools/install.py --build-go-only $customTag win x86_64
+            Exec uv run --frozen --only-group install python tools/install.py $customTag win x86_64
 
             if (Test-Path "MXU/mxu.exe") {
               Copy-Item "MXU/mxu.exe" "install/MDA.exe" -Force
