@@ -159,7 +159,10 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.x"
+          python-version: "3.12"
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v9.0.0
 
       - name: Download MaaFramework
         uses: robinraju/release-downloader@v1
@@ -191,17 +194,19 @@ jobs:
           archive_file_path='${{ fromJson(steps.download_mxu.outputs.downloaded_files)[0] }}'
           rm -f "$archive_file_path"
 
-      - name: Install Python requirements
+      - name: Clean install directory
         shell: bash
-        run: python -m pip install -r tools/requirements.txt
+        run: |
+          set -euo pipefail
+          rm -rf install/
 
       - name: Build Go Agent
         shell: bash
-        run: python tools/install.py --build-go-only ${{ needs.prepare.outputs.custom_tag }} ${{ matrix.os }} ${{ matrix.arch }}
+        run: uv run --frozen --only-group install python tools/install.py --build-go-only ${{ needs.prepare.outputs.custom_tag }} ${{ matrix.os }} ${{ matrix.arch }}
 
       - name: Install
         shell: bash
-        run: python tools/install.py ${{ needs.prepare.outputs.custom_tag }} ${{ matrix.os }} ${{ matrix.arch }}
+        run: uv run --frozen --only-group install python tools/install.py ${{ needs.prepare.outputs.custom_tag }} ${{ matrix.os }} ${{ matrix.arch }}
 
       - name: Integrate MXU into install directory
         if: ${{ !(matrix.os == 'linux' && matrix.arch == 'aarch64') }}
